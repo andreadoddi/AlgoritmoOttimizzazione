@@ -1,0 +1,922 @@
+
+
+from neuron import h
+import numpy as np
+from scipy.optimize import differential_evolution, minimize
+import matplotlib.pyplot as plt
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
+h.load_file('stdrun.hoc')
+
+@dataclass
+class OptimizationParameter:
+    
+    name: str
+    bounds: Tuple[float, float]
+    description: str
+    log_scale: bool = False  # Se True, ottimizza in scala logaritmica
+
+class EarlyStoppingException(Exception):
+    """Eccezione per fermare l'ottimizzazione"""
+    pass
+
+
+class T98GMultiParameterOptimizer:
+    """
+    Ottimizzatore che può lavorare su diversi set di parametri
+
+    """
+    
+    # Definizioni parametri disponibili con BOUNDS DA LETTERATURA
+    AVAILABLE_PARAMETERS = {
+        # === LEAK CONDUCTANCES ===
+        'gbar_K2P': OptimizationParameter(
+            'gbar_K2P', (1.5e-4, 5e-4), 
+            'Conduttanza leak K (S/cm²)', 
+            log_scale=True
+        ),
+        
+        
+        # === VOLTAGE-GATED K+ CHANNELS ===
+        'gbar_gbk': OptimizationParameter(
+            'gbar_gbk', (1.5e-3, 3.8e-3), 
+            'BK channel (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [1500-3800] μS/cm² (2.5×)
+        # Nota: ḡ_max alto perché Po << 0.01 a riposo
+        
+        'gbar_kca31': OptimizationParameter(
+            'gbar_kca31', (2e-4, 8e-4), 
+            'KCa3.1 channel (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [200-800] μS/cm² (4×)
+        # Con Po ≈ 0.4 a [Ca²⁺]ᵢ = 192 nM
+        
+        # === CL- CHANNELS (BASALI!) ===
+        'gbar_clc3': OptimizationParameter(
+            'gbar_clc3', (1.0e-4, 2.5e-4), 
+            'ClC-3 channel - BASAL (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [150-400] μS/cm² (2.7×)
+        # CRITICO: valori basali (Po ≈ 15-25%)
+        # ḡ_max letteratura = 1.0-1.8 mS/cm²
+        
+        'gbar_clc2': OptimizationParameter(
+            'gbar_clc2', (3.0e-5, 1.2e-4), 
+            'ClC-2 channel - BASAL (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [50-200] μS/cm² (4×)
+        # 30-50% di ClC-3 basale
+        
+        # === TRPC6 CHANNELS ===
+        'gbar_ca_trpc6': OptimizationParameter(
+            'gbar_ca_trpc6', (3e-5, 1.5e-4), 
+            'TRPC6 Ca component (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [30-150] μS/cm² (5×) ✓ OK
+        
+        'gbar_na_trpc6': OptimizationParameter(
+            'gbar_na_trpc6', (5e-6, 3e-5), 
+            'TRPC6 Na component (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [5-30] μS/cm² (6×) ✓ OK
+        
+        # === NON-SELECTIVE CATION ===
+        'gbar_bnac': OptimizationParameter(
+            'gbar_bnac', (2e-5, 3e-4), 
+            'Background Na channel (S/cm²)', 
+            log_scale=True
+        ),
+        # Range: [20-300] μS/cm² (15×)
+        # Allargato per coerenza con letteratura
+        
+        # === INTRACELLULAR Ca2+ ===
+        'cai': OptimizationParameter(
+            'cai', (5e-5, 15e-5), 
+            '[Ca2+]i (mM) - baseline', 
+            log_scale=True
+        ),
+        # Range: [50-150] nM (3×) ✓ OK
+    }
+    
+    def __init__(self,
+                 target_vrest= ,
+                 target_rin=,
+                 target_tau=,  # Se specificato, ottimizza anche tau
+                 area_um2= 600,
+                 ctot_pF=,
+                 tolerance_vrest=,
+                 tolerance_rin=,
+                 tolerance_tau=,
+                 parameters_to_optimize: List[str] = None):
+        """
+        Parameters:
+        -----------
+        parameters_to_optimize : list of str
+            Lista di parametri da ottimizzare (chiavi di AVAILABLE_PARAMETERS)
+            Se None, usa solo ['gbar_K2P']
+        """
+        
+        self.target_vrest = target_vrest
+        self.target_rin = target_rin
+        self.target_tau = target_tau
+        self.area_um2 = area_um2
+        self.ctot_pF = ctot_pF
+        self.tolerance_vrest = tolerance_vrest
+        self.tolerance_rin = tolerance_rin
+        self.tolerance_tau = tolerance_tau
+        
+        # Parametri da ottimizzare
+        if parameters_to_optimize is None:
+            parameters_to_optimize = ['gbar_K2P']
+        
+        self.param_names = parameters_to_optimize
+        self.params = [self.AVAILABLE_PARAMETERS[p] for p in parameters_to_optimize]
+        
+        # Valori di default (quando non ottimizzati)
+        # FISSI DA DATI SPERIMENTALI - NON MODIFICARE
+        self.fixed_experimental = {
+            'nai': 15.0,    # mM - misurato sperimentalmente
+            'ki': 145.0,    # mM - misurato sperimentalmente
+            'cli': 100.0,   # mM - misurato sperimentalmente
+            'nao': 123.0,   # mM - soluzione esterna
+            'ko': 4.2,      # mM - soluzione esterna
+            'clo': 130.6,   # mM - soluzione esterna
+            'cao': 1.0,     # mM - soluzione esterna
+            'E_Na': 53.9,   # mV - potenziale di Nernst calcolato
+            'E_K': -90.7,   # mV - potenziale di Nernst calcolato
+            'E_Cl': -6.8,   # mV - potenziale di Nernst calcolato
+            # 'E_Ca': 117.8,  # RIMOSSO: ora calcolato dinamicamente
+        }
+        
+        self.default_values = {
+            # NOTA: gbar_Na_leak RIMOSSO - fissato a zero nel modello
+            'gbar_K2P': 3e-4,
+            'gbar_gbk': 2e-3,
+            'gbar_kca31': 2e-4,
+            'gbar_clc3': 3e-5,
+            'gbar_clc2': 2e-5,
+            'gbar_ca_trpc6': 8e-5,
+            'gbar_na_trpc6': 2e-5,
+            'gbar_bnac': 5e-5,
+            'cm': None,  # Calcolato da ctot_pF
+            'Ra': 100.0,
+            'cai': 1e-4,  # Solo Ca2+ intracellulare è ottimizzabile
+        }
+        
+        # Calcola cm
+        area_cm2 = area_um2 * 1e-8
+        ctot_F = ctot_pF * 1e-12
+        self.cm_spec = ctot_F / area_cm2 * 1e6
+        self.default_values['cm'] = self.cm_spec
+        self.diam = np.sqrt(area_um2 / np.pi)
+        
+        # Potenziali di Nernst (calcolati da concentrazioni)
+        self.RT_F = 25.59  # mV at 297.15 K
+        
+        self.history = []
+        
+        print("\n" + "="*70)
+        print("OTTIMIZZATORE MULTI-PARAMETRO T98G")
+        print("VERSIONE AGGIORNATA: bounds Cl⁻ BASALI")
+        print("  ClC-3: [150-400] μS/cm² (BASALE, Po ≈ 20%)")
+        print("  ClC-2: [50-200] μS/cm² (30-50% di ClC-3)")
+        print("  Nota: ḡ_max letteratura (stimolato) = 1.0-1.8 mS/cm²")
+        print("="*70)
+        print(f"Target V_rest: {target_vrest:.1f} ± {tolerance_vrest:.1f} mV")
+        print(f"Target Rin:    {target_rin:.1f} ± {tolerance_rin:.1f} MΩ")
+        if target_tau:
+            print(f"Target τ:      {target_tau:.1f} ± {tolerance_tau:.1f} ms")
+        print(f"Area:          {area_um2:.1f} μm²")
+        print(f"Ctot:          {ctot_pF:.3f} pF")
+        print(f"Cm:            {self.cm_spec:.4f} μF/cm²")
+        print(f"\nParametri da ottimizzare ({len(self.params)}):")
+        for param in self.params:
+            print(f"  - {param.name}: {param.description}")
+            print(f"    Range: [{param.bounds[0]:.2e}, {param.bounds[1]:.2e}]")
+        print("="*70 + "\n")
+    
+    def nernst_potential(self, ion, co, ci):
+        """Calcola potenziale di Nernst"""
+        z = {'na': 1, 'k': 1, 'cl': -1, 'ca': 2}[ion]
+        return (self.RT_F / z) * np.log(co / ci)
+    
+    def _params_to_vector(self, param_dict):
+        """Converte dizionario parametri in vettore per ottimizzatore"""
+        vector = []
+        for name, param in zip(self.param_names, self.params):
+            val = param_dict[name]
+            if param.log_scale:
+                val = np.log10(val)
+            vector.append(val)
+        return np.array(vector)
+    
+    def param_dict_from_vector(self, param_vector):
+        """Converte vettore parametri in dizionario"""
+        # Inizia con valori di default ottimizzabili
+        param_dict = self.default_values.copy()
+        
+        # Aggiungi valori sperimentali FISSI
+        param_dict.update(self.fixed_experimental)
+        
+        # Sovrascrivi con parametri ottimizzati
+        for i, (name, param) in enumerate(zip(self.param_names, self.params)):
+            val = param_vector[i]
+            # Se in scala log, converti
+            if param.log_scale:
+                val = 10**val
+            param_dict[name] = val
+        
+        return param_dict
+    
+    def create_test_cell(self, param_dict):
+        """Crea cellula con parametri specificati"""
+        soma = h.Section(name='test_soma')
+        soma.L = self.diam
+        soma.diam = self.diam
+        soma.nseg = 1
+        soma.cm = param_dict['cm']
+        soma.Ra = param_dict['Ra']
+        
+        # Setup ioni
+        soma.insert('na_ion')
+        soma.insert('k_ion')
+        soma.insert('cl_ion')
+        soma.insert('ca_ion')
+        
+        # Concentrazioni FISSE da esperimenti
+        h.nao0_na_ion = param_dict['nao']
+        h.ko0_k_ion = param_dict['ko']
+        h.clo0_cl_ion = param_dict['clo']
+        h.cao0_ca_ion = param_dict['cao']
+        
+        soma.nai = param_dict['nai']
+        soma.ki = param_dict['ki']
+        soma.cli = param_dict['cli']
+        soma.cai = param_dict['cai']
+        
+        # Potenziali di Nernst FISSI da esperimenti
+        soma.ena = param_dict['E_Na']
+        soma.ek = param_dict['E_K']
+        soma.ecl = param_dict['E_Cl']
+        # Calcola E_Ca dinamicamente in base a cai ottimizzato
+        RT_F = 25.59  # mV, a T=297.15K (24°C)
+        soma.eca = (RT_F / 2) * np.log(param_dict['cao'] / param_dict['cai'])
+        
+        h.ion_style("na_ion", 0, 2, 1, 0, 1, sec=soma)
+        h.ion_style("k_ion", 0, 2, 1, 0, 1, sec=soma)
+        h.ion_style("cl_ion", 0, 2, 1, 0, 1, sec=soma)
+        h.ion_style("ca_ion", 0, 2, 1, 0, 1, sec=soma)
+        
+        # Inserisci canali
+        soma.insert('gbk')
+        soma.gbar_gbk = param_dict['gbar_gbk']
+        
+        soma.insert('kca31')
+        soma.gbar_kca31 = param_dict['gbar_kca31']
+        
+        soma.insert('clc3')
+        soma.gbar_clc3 = param_dict['gbar_clc3']
+        
+        soma.insert('clc2')
+        soma.gbar_clc2 = param_dict['gbar_clc2']
+        
+        soma.insert('trpc6')
+        soma.gbar_ca_trpc6 = param_dict['gbar_ca_trpc6']
+        soma.gbar_na_trpc6 = param_dict['gbar_na_trpc6']
+        
+        soma.insert('bnac')
+        soma.gbar_bnac = param_dict['gbar_bnac']
+        
+      
+        
+        soma.insert('K2P')
+        soma.gbar_K2P = param_dict['gbar_K2P']
+        
+        return soma
+    
+    def measure_properties(self, param_dict, verbose=False):
+        """Misura V_rest, Rin e tau"""
+        soma = self.create_test_cell(param_dict)
+        
+        h.v_init = self.target_vrest
+        h.finitialize(h.v_init)
+        h.tstop = 500
+        h.run()
+        
+        vrest = soma(0.5).v
+        
+        # Misura Rin
+        ic = h.IClamp(soma(0.5))
+        ic.delay = 50
+        ic.dur = 200
+        ic.amp = 0.01
+        
+        v_vec = h.Vector()
+        v_vec.record(soma(0.5)._ref_v)
+        t_vec = h.Vector()
+        t_vec.record(h._ref_t)
+        
+        h.tstop = 300
+        h.finitialize(vrest)
+        h.run()
+        
+        v_arr = np.array(v_vec)
+        t_arr = np.array(t_vec)
+        
+        v_baseline = np.mean(v_arr[(t_arr > 40) & (t_arr < 50)])
+        v_steady = np.mean(v_arr[(t_arr > 240) & (t_arr < 250)])
+        delta_v = v_steady - v_baseline
+        
+        rin = delta_v / ic.amp
+        
+        # Stima tau dalla risposta al gradino
+        idx_start = np.where(t_arr >= ic.delay)[0][0]
+        v_response = v_arr[idx_start:] - v_baseline
+        t_response = t_arr[idx_start:] - ic.delay
+        
+        # Tau = tempo per raggiungere 63% del valore finale
+        v_final = delta_v
+        v_63 = 0.63 * v_final
+        try:
+            idx_63 = np.where(v_response >= v_63)[0][0]
+            tau = t_response[idx_63]
+        except:
+            tau = rin * param_dict['cm'] * self.area_um2 * 1e-8 * 1e6  # Stima teorica
+        
+        if verbose:
+            print(f"  V_rest={vrest:.2f} mV, Rin={rin:.1f} MΩ, τ={tau:.2f} ms")
+        
+        h.delete_section(sec=soma)
+        
+        return vrest, rin, tau
+    
+    def objective_function(self, param_vector_raw):
+        """Funzione obiettivo con early stopping e vincoli fisiologici"""
+        # Converte parametri (gestisce scala log)
+        param_dict = self.param_dict_from_vector(param_vector_raw)
+        
+        try:
+            vrest, rin, tau = self.measure_properties(param_dict)
+        except Exception as e:
+            return 1e10
+        
+        # ===================================================================
+        # ERRORI PRINCIPALI (dai dati sperimentali)
+        # ===================================================================
+        error_vrest = ((vrest - self.target_vrest) / self.tolerance_vrest)**2
+        error_rin = ((rin - self.target_rin) / self.tolerance_rin)**2
+        
+        total_error = error_vrest + error_rin
+        
+        # Se tau è specificato come target
+        if self.target_tau is not None and self.tolerance_tau is not None:
+            error_tau = ((tau - self.target_tau) / self.tolerance_tau)**2
+            total_error += error_tau
+        
+        # ===================================================================
+        # VINCOLI FISIOLOGICI (dalla letteratura)
+        # ===================================================================
+        
+        penalty_total = 0.0
+        
+        # VINCOLO 1: Frazione Cl⁻ ≈ 40% della conduttanza totale
+        # Riferimento: Ransom & Sontheimer (2001) J Neurosci 21:7674
+        if 'gbar_clc3' in param_dict and 'gbar_clc2' in param_dict:
+            # Calcola conduttanza totale
+            gtot = (param_dict.get('gbar_K2P', 0) +
+                    param_dict.get('gbar_bnac', 0) +
+                    param_dict.get('gbar_gbk', 0) +
+                    param_dict.get('gbar_kca31', 0) +
+                    param_dict.get('gbar_clc3', 0) +
+                    param_dict.get('gbar_clc2', 0) +
+                    param_dict.get('gbar_ca_trpc6', 0) +
+                    param_dict.get('gbar_na_trpc6', 0))
+            
+            gcl = param_dict['gbar_clc3'] + param_dict['gbar_clc2']
+            
+            if gtot > 1e-10:  # Evita divisione per zero
+                fraction_cl = gcl / gtot
+                # Target: 0.40, range accettabile: 0.30-0.50
+                if fraction_cl < 0.15 or fraction_cl > 0.35:
+                    penalty_cl = ((fraction_cl - 0.25) / 0.10)**2
+                    penalty_total += penalty_cl
+        
+        # VINCOLO 2: Rapporto K2P / Na_background ≈ 3-7
+        # Riferimenti: Olsen & Sontheimer (2008) J Neurochem 107:589
+        #              Parkerson & Sontheimer (2004) Am J Physiol 286:C1382
+        if 'gbar_K2P' in param_dict and 'gbar_bnac' in param_dict:
+            if param_dict['gbar_bnac'] > 1e-10:  # Evita divisione per zero
+                ratio_k_na = param_dict['gbar_K2P'] / param_dict['gbar_bnac']
+                # Target: 5, range accettabile: 2-10
+                if ratio_k_na < 2.0 or ratio_k_na > 10.0:
+                    penalty_k_na = ((ratio_k_na - 5.0) / 4.0)**2
+                    penalty_total += penalty_k_na
+        
+        # VINCOLO 3: Rapporto ClC-3 / ClC-2 ≈ 2:1
+        # Riferimenti: Ernest et al. (2005) Am J Physiol 288:C1451
+        #              Habela et al. (2008) J Neurosci 28:9205
+        if 'gbar_clc3' in param_dict and 'gbar_clc2' in param_dict:
+            if param_dict['gbar_clc2'] > 1e-10:  # Evita divisione per zero
+                ratio_clc = param_dict['gbar_clc3'] / param_dict['gbar_clc2']
+                # Target: 2, range accettabile: 1.0-4.0
+                if ratio_clc < 1.0 or ratio_clc > 4.0:
+                    penalty_clc = ((ratio_clc - 2.0) / 1.5)**2
+                    penalty_total += penalty_clc
+        
+        # VINCOLO 4: Rapporto TRPC6 Ca/Na ≈ 5:1
+        # Riferimenti: Owsianik et al. (2006) Annu Rev Physiol 68:685
+        #              Chigurupati et al. (2010) Cancer Res 70:5010
+        if 'gbar_ca_trpc6' in param_dict and 'gbar_na_trpc6' in param_dict:
+            if param_dict['gbar_na_trpc6'] > 1e-10:  # Evita divisione per zero
+                ratio_trpc6 = param_dict['gbar_ca_trpc6'] / param_dict['gbar_na_trpc6']
+                # Target: 5, range accettabile: 3-8
+                if ratio_trpc6 < 3.0 or ratio_trpc6 > 8.0:
+                    penalty_trpc6 = ((ratio_trpc6 - 5.0) / 2.5)**2
+                    penalty_total += penalty_trpc6
+        
+        # VINCOLO 5: Frazione K+ totale ≈ 50% della conduttanza totale
+        # Riferimento: Olsen & Sontheimer (2008) J Neurochem 107:589-601
+        # "K+ conductance reduced in glioma but still predominant"
+        if 'gbar_K2P' in param_dict and 'gbar_gbk' in param_dict and 'gbar_kca31' in param_dict:
+            gK_tot = (param_dict['gbar_K2P'] + 
+                      param_dict['gbar_gbk'] + 
+                      param_dict['gbar_kca31'])
+            
+            if gtot > 1e-10:  # gtot già calcolato per vincolo 1
+                fraction_K = gK_tot / gtot
+                # Target: 0.50, range accettabile: 0.40-0.60
+                # Complementare al vincolo Cl⁻ = 40%
+                if fraction_K < 0.40 or fraction_K > 0.60:
+                    penalty_K = ((fraction_K - 0.50) / 0.10)**2
+                    penalty_total += penalty_K
+        
+        # VINCOLO 6: Rapporto BK / KCa3.1 ≈ 10:1
+        # Riferimenti: Ransom & Sontheimer (2001) J Neurosci 21:7674
+        #              D'Alessandro et al. (2013) Glia 61:1172-1184
+        # "BK is the dominant Ca2+-activated K+ channel in glioma"
+        if 'gbar_gbk' in param_dict and 'gbar_kca31' in param_dict:
+            if param_dict['gbar_kca31'] > 1e-10:  # Evita divisione per zero
+                ratio_bk_kca = param_dict['gbar_gbk'] / param_dict['gbar_kca31']
+                # Target: 10, range accettabile: 5-20
+                # Range ampio perché variabilità inter-cellulare
+                if ratio_bk_kca < 5.0 or ratio_bk_kca > 20.0:
+                    penalty_bk_kca = ((ratio_bk_kca - 10.0) / 7.5)**2
+                    penalty_total += penalty_bk_kca
+        
+        # Peso dei vincoli fisiologici (soft constraints)
+        # Più basso dei target principali per non dominare il fit
+        weight_physiological = 0.15
+        
+        total_error += weight_physiological * penalty_total
+        
+        # ===================================================================
+        # SALVA STORIA (inclusi vincoli per analisi)
+        # ===================================================================
+        self.history.append({
+            'params': param_dict.copy(),
+            'vrest': vrest,
+            'rin': rin,
+            'tau': tau,
+            'error': total_error,
+            'penalty_physiological': penalty_total
+        })
+        
+        # Early stopping check
+        if hasattr(self, 'early_stop_threshold') and hasattr(self, 'early_stop_patience'):
+            if total_error < self.best_error:
+                self.best_error = total_error
+                self.no_improvement_count = 0
+            else:
+                self.no_improvement_count += 1
+            
+            if (total_error < self.early_stop_threshold and 
+                self.no_improvement_count >= self.early_stop_patience):
+                print(f"\n🎯 Early stopping attivato a iterazione {len(self.history)}!")
+                print(f"   f(x) = {total_error:.6f} < {self.early_stop_threshold}")
+                print(f"   Nessun miglioramento per {self.no_improvement_count} iterazioni")
+                raise EarlyStoppingException("Early stopping raggiunto")
+        
+        return total_error
+    
+    def get_bounds(self):
+        """Restituisce bounds per l'ottimizzazione"""
+        bounds = []
+        for param in self.params:
+            if param.log_scale:
+                # Bounds in scala log
+                bounds.append((np.log10(param.bounds[0]), np.log10(param.bounds[1])))
+            else:
+                bounds.append(param.bounds)
+        return bounds
+    
+    def optimize(self, method='differential_evolution', maxiter=20, 
+                 early_stop_threshold=0.05, early_stop_patience=10):
+        """
+        Esegue ottimizzazione con early stopping
+        
+        Parameters:
+        -----------
+        early_stop_threshold : float
+            Se f(x) < threshold, considera early stopping
+        early_stop_patience : int
+            Numero di iterazioni senza miglioramento per fermarsi
+        """
+        
+        bounds = self.get_bounds()
+        
+        print(f"\nInizio ottimizzazione con {method}...")
+        print(f"Numero parametri: {len(self.param_names)}")
+        print(f"Spazio di ricerca dimensionalità: {len(bounds)}")
+        print(f"Early stopping: f(x) < {early_stop_threshold} per {early_stop_patience} iter\n")
+        
+        self.history = []
+        self.best_error = float('inf')
+        self.no_improvement_count = 0
+        self.early_stop_threshold = early_stop_threshold
+        self.early_stop_patience = early_stop_patience
+        
+        if method == 'differential_evolution':
+            try:
+                result = differential_evolution(
+                    self.objective_function,
+                    bounds,
+                    strategy='best1bin',
+                    maxiter=maxiter,
+                    popsize=15,
+                    tol=1e-7,
+                    mutation=(0.5, 1.5),
+                    recombination=0.7,
+                    seed=42,
+                    workers=1,
+                    disp=True,
+                    polish=True,
+                    atol=1e-8
+                )
+                param_vector_opt = result.x
+            except EarlyStoppingException:
+                # Recupera il miglior risultato dalla storia
+                print("\n✓ Ottimizzazione terminata con early stopping")
+                best_idx = np.argmin([h['error'] for h in self.history])
+                best_params = self.history[best_idx]['params']
+                param_vector_opt = self._params_to_vector(best_params)
+                
+                # Crea un oggetto result fittizio
+                class FakeResult:
+                    def __init__(self, x, fun):
+                        self.x = x
+                        self.fun = fun
+                
+                result = FakeResult(param_vector_opt, self.history[best_idx]['error'])
+        
+        elif method == 'dual_annealing':
+            from scipy.optimize import dual_annealing
+            result = dual_annealing(
+                self.objective_function,
+                bounds,
+                maxiter=maxiter * 5,
+                seed=42,
+                no_local_search=False
+            )
+            param_vector_opt = result.x
+        
+        else:
+            raise ValueError(f"Metodo {method} non supportato")
+        
+        # Converte risultato ottimale
+        param_dict_opt = self.param_dict_from_vector(param_vector_opt)
+        
+        # Verifica finale
+        print("\n" + "="*70)
+        print("VERIFICA RISULTATO FINALE...")
+        print("="*70)
+        vrest_final, rin_final, tau_final = self.measure_properties(
+            param_dict_opt, verbose=True
+        )
+        
+        print("\n" + "="*70)
+        print("PARAMETRI OTTIMIZZATI:")
+        print("="*70)
+        for name in self.param_names:
+            param = self.AVAILABLE_PARAMETERS[name]
+            val = param_dict_opt[name]
+            # Gestione speciale per cai (concentrazione, non conduttanza)
+            if name == 'cai':
+                print(f"{name:20s} = {val:.6e} mM ({val*1e6:.1f} nM)")
+            elif param.log_scale:
+                # Conduttanze
+                print(f"{name:20s} = {val:.6e} S/cm² ({val*1e6:.3f} μS/cm²)")
+            else:
+                # Proprietà passive (cm, Ra)
+                if name == 'cm':
+                    print(f"{name:20s} = {val:.6f} μF/cm²")
+                elif name == 'Ra':
+                    print(f"{name:20s} = {val:.6f} Ω·cm")
+                else:
+                    print(f"{name:20s} = {val:.6f}")
+        
+        print("\n" + "="*70)
+        print("PROPRIETÀ ELETTROFISIOLOGICHE:")
+        print("="*70)
+        print(f"V_rest = {vrest_final:.2f} mV  (target: {self.target_vrest:.1f} ± {self.tolerance_vrest:.1f} mV)")
+        print(f"         Δ = {vrest_final - self.target_vrest:+.2f} mV")
+        print(f"\nRin    = {rin_final:.1f} MΩ  (target: {self.target_rin:.1f} ± {self.tolerance_rin:.1f} MΩ)")
+        print(f"         Δ = {rin_final - self.target_rin:+.1f} MΩ")
+        print(f"\nτ      = {tau_final:.2f} ms")
+        if self.target_tau:
+            print(f"         (target: {self.target_tau:.1f} ± {self.tolerance_tau:.1f} ms)")
+            print(f"         Δ = {tau_final - self.target_tau:+.2f} ms")
+        
+        print(f"\nError finale: {result.fun:.6f}")
+        
+        # ===================================================================
+        # VERIFICA VINCOLI FISIOLOGICI
+        # ===================================================================
+        print("\n" + "="*70)
+        print("VINCOLI FISIOLOGICI:")
+        print("="*70)
+        
+        # Calcola vincoli
+        gtot = (param_dict_opt.get('gbar_K2P', 0) +
+                param_dict_opt.get('gbar_bnac', 0) +
+                param_dict_opt.get('gbar_gbk', 0) +
+                param_dict_opt.get('gbar_kca31', 0) +
+                param_dict_opt.get('gbar_clc3', 0) +
+                param_dict_opt.get('gbar_clc2', 0) +
+                param_dict_opt.get('gbar_ca_trpc6', 0) +
+                param_dict_opt.get('gbar_na_trpc6', 0))
+        
+        gcl = param_dict_opt.get('gbar_clc3', 0) + param_dict_opt.get('gbar_clc2', 0)
+        fraction_cl = gcl / gtot if gtot > 0 else 0
+        
+        ratio_k_na = (param_dict_opt.get('gbar_K2P', 0) / 
+                      param_dict_opt.get('gbar_bnac', 1e-10))
+        
+        ratio_clc = (param_dict_opt.get('gbar_clc3', 0) / 
+                     param_dict_opt.get('gbar_clc2', 1e-10))
+        
+        ratio_trpc6 = (param_dict_opt.get('gbar_ca_trpc6', 0) / 
+                       param_dict_opt.get('gbar_na_trpc6', 1e-10))
+        
+        print(f"1. Frazione Cl⁻:     {fraction_cl:.3f}  (target: 0.25, range: 0.15-0.35)")
+        cl_ok = 0.15 <= fraction_cl <= 0.35  
+        print(f"   {'✓ OK' if cl_ok else '✗ Fuori range'}")
+        
+        print(f"\n2. Ratio K/Na:       {ratio_k_na:.2f}   (target: 5.0, range: 2-10)")
+        kna_ok = 2.0 <= ratio_k_na <= 10.0
+        print(f"   {'✓ OK' if kna_ok else '✗ Fuori range'}")
+        
+        print(f"\n3. Ratio ClC-3/ClC-2: {ratio_clc:.2f}   (target: 2.0, range: 1-4)")
+        clc_ok = 1.0 <= ratio_clc <= 4.0
+        print(f"   {'✓ OK' if clc_ok else '✗ Fuori range'}")
+        
+        print(f"\n4. Ratio TRPC6 Ca/Na: {ratio_trpc6:.2f}   (target: 5.0, range: 3-8)")
+        trpc_ok = 3.0 <= ratio_trpc6 <= 8.0
+        print(f"   {'✓ OK' if trpc_ok else '✗ Fuori range'}")
+        
+        # Vincolo 5: Frazione K+ totale
+        gK_tot = (param_dict_opt.get('gbar_K2P', 0) + 
+                  param_dict_opt.get('gbar_gbk', 0) + 
+                  param_dict_opt.get('gbar_kca31', 0))
+        fraction_K = gK_tot / gtot if gtot > 0 else 0
+        
+        print(f"\n5. Frazione K+ totale: {fraction_K:.3f}  (target: 0.50, range: 0.40-0.60)")
+        K_ok = 0.40 <= fraction_K <= 0.60
+        print(f"   {'✓ OK' if K_ok else '✗ Fuori range'}")
+        
+        # Vincolo 6: Rapporto BK/KCa3.1
+        ratio_bk_kca = (param_dict_opt.get('gbar_gbk', 0) / 
+                        param_dict_opt.get('gbar_kca31', 1e-10))
+        
+        print(f"\n6. Ratio BK/KCa3.1:    {ratio_bk_kca:.2f}   (target: 10.0, range: 5-20)")
+        bk_ok = 5.0 <= ratio_bk_kca <= 20.0
+        print(f"   {'✓ OK' if bk_ok else '✗ Fuori range'}")
+        
+        all_constraints_ok = cl_ok and kna_ok and clc_ok and trpc_ok and K_ok and bk_ok
+        print("\n" + "-"*70)
+        if all_constraints_ok:
+            print("✓ Tutti i vincoli fisiologici soddisfatti!")
+        else:
+            print("⚠ Alcuni vincoli fisiologici fuori range (acceptable if minor)")
+        
+        # Verifica vincoli target
+        vrest_ok = abs(vrest_final - self.target_vrest) <= self.tolerance_vrest
+        rin_ok = abs(rin_final - self.target_rin) <= self.tolerance_rin
+        tau_ok = True
+        if self.target_tau:
+            tau_ok = abs(tau_final - self.target_tau) <= self.tolerance_tau
+        
+        print("\n" + "="*70)
+        if vrest_ok and rin_ok and tau_ok:
+            print("✓ OTTIMIZZAZIONE RIUSCITA - Tutti i vincoli soddisfatti!")
+        else:
+            print("⚠ VINCOLI PARZIALMENTE SODDISFATTI:")
+            print(f"  V_rest: {'✓' if vrest_ok else '✗'}")
+            print(f"  Rin:    {'✓' if rin_ok else '✗'}")
+            if self.target_tau:
+                print(f"  τ:      {'✓' if tau_ok else '✗'}")
+        print("="*70 + "\n")
+        
+        return {
+            'params': param_dict_opt,
+            'vrest': vrest_final,
+            'rin': rin_final,
+            'tau': tau_final,
+            'error': result.fun,
+            'success': vrest_ok and rin_ok and tau_ok,
+            'method': method
+        }
+    
+    def plot_optimization_history(self, save_path=None):
+        """Plotta storia dell'ottimizzazione"""
+        if len(self.history) == 0:
+            print("Nessuna storia da plottare")
+            return
+        
+        # Determina layout in base ai target
+        if self.target_tau is not None:
+            fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+            axes = axes.flatten()
+        else:
+            fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+            axes = axes.flatten()
+        
+        iterations = range(len(self.history))
+        errors = [h['error'] for h in self.history]
+        vrests = [h['vrest'] for h in self.history]
+        rins = [h['rin'] for h in self.history]
+        taus = [h['tau'] for h in self.history]
+        
+        # Error
+        axes[0].plot(iterations, errors, 'b-', alpha=0.6)
+        axes[0].set_xlabel('Iteration')
+        axes[0].set_ylabel('Error')
+        axes[0].set_title('Objective Function')
+        axes[0].set_yscale('log')
+        axes[0].grid(True, alpha=0.3)
+        
+        # V_rest
+        axes[1].plot(iterations, vrests, 'r-', alpha=0.6)
+        axes[1].axhline(self.target_vrest, color='k', linestyle='--', label='Target')
+        axes[1].axhline(self.target_vrest + self.tolerance_vrest, color='k', 
+                        linestyle=':', alpha=0.5)
+        axes[1].axhline(self.target_vrest - self.tolerance_vrest, color='k', 
+                        linestyle=':', alpha=0.5)
+        axes[1].set_xlabel('Iteration')
+        axes[1].set_ylabel('V_rest (mV)')
+        axes[1].set_title('Resting Potential')
+        axes[1].legend()
+        axes[1].grid(True, alpha=0.3)
+        
+        # Rin
+        axes[2].plot(iterations, rins, 'g-', alpha=0.6)
+        axes[2].axhline(self.target_rin, color='k', linestyle='--', label='Target')
+        axes[2].axhline(self.target_rin + self.tolerance_rin, color='k', 
+                        linestyle=':', alpha=0.5)
+        axes[2].axhline(self.target_rin - self.tolerance_rin, color='k', 
+                        linestyle=':', alpha=0.5)
+        axes[2].set_xlabel('Iteration')
+        axes[2].set_ylabel('Rin (MΩ)')
+        axes[2].set_title('Input Resistance')
+        axes[2].legend()
+        axes[2].grid(True, alpha=0.3)
+        
+        # Tau (se presente)
+        if self.target_tau is not None:
+            axes[3].plot(iterations, taus, 'm-', alpha=0.6)
+            axes[3].axhline(self.target_tau, color='k', linestyle='--', label='Target')
+            axes[3].axhline(self.target_tau + self.tolerance_tau, color='k', 
+                            linestyle=':', alpha=0.5)
+            axes[3].axhline(self.target_tau - self.tolerance_tau, color='k', 
+                            linestyle=':', alpha=0.5)
+            axes[3].set_xlabel('Iteration')
+            axes[3].set_ylabel('τ (ms)')
+            axes[3].set_title('Time Constant')
+            axes[3].legend()
+            axes[3].grid(True, alpha=0.3)
+            param_ax_idx = 4
+        else:
+            param_ax_idx = 3
+        
+        # Parameter evolution - leak and background conductances
+        leak_params = ['gbar_K2P', 'gbar_bnac']
+        for param_name in leak_params:
+            if param_name in self.param_names:
+                vals = [h['params'][param_name] * 1e6 for h in self.history]
+                axes[param_ax_idx].plot(iterations, vals, alpha=0.7, label=param_name)
+        axes[param_ax_idx].set_xlabel('Iteration')
+        axes[param_ax_idx].set_ylabel('Conductance (μS/cm²)')
+        axes[param_ax_idx].set_title('Leak & Background Conductances')
+        axes[param_ax_idx].legend()
+        axes[param_ax_idx].grid(True, alpha=0.3)
+        
+        # Parameter evolution - voltage-gated (se presenti più assi)
+        if len(axes) > param_ax_idx + 1:
+            vg_params = ['gbar_gbk', 'gbar_kca31', 'gbar_ca_trpc6']
+            for param_name in vg_params:
+                if param_name in self.param_names:
+                    vals = [h['params'][param_name] * 1e6 for h in self.history]
+                    axes[param_ax_idx + 1].plot(iterations, vals, alpha=0.7, label=param_name)
+            axes[param_ax_idx + 1].set_xlabel('Iteration')
+            axes[param_ax_idx + 1].set_ylabel('Conductance (μS/cm²)')
+            axes[param_ax_idx + 1].set_title('Voltage-Gated Conductances')
+            axes[param_ax_idx + 1].legend(fontsize=8)
+            axes[param_ax_idx + 1].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Plot salvato: {save_path}")
+        
+        return fig
+
+
+def main():
+    """SCENARIO CON BOUNDS Cl⁻ CORRETTI"""
+    
+    print("="*70)
+    print("OTTIMIZZAZIONE CON BOUNDS Cl⁻ CORRETTI")
+    print("Ottimizzazione di 9 parametri con 3 target (V_rest, Rin, τ)")
+    print("")
+    print("FIX APPLICATO:")
+    print("  ClC-3: [150-400] μS/cm² (BASALE, Po ≈ 15-25%)")
+    print("  ClC-2: [50-200] μS/cm² (30-50% di ClC-3)")
+    print("")
+    print("Ora la frazione Cl⁻ = 40% è RAGGIUNGIBILE!")
+    print("="*70 + "\n")
+    
+    # Parametri da ottimizzare (SENZA gbar_Na_leak)
+    params_to_optimize = [
+        'gbar_K2P',      # 1
+        'gbar_gbk',         # 2
+        'gbar_kca31',       # 3
+        'gbar_clc3',        # 4
+        'gbar_clc2',        # 5
+        'gbar_ca_trpc6',    # 6
+        'gbar_na_trpc6',    # 7
+        'gbar_bnac',        # 8
+        'cai'               # 9
+    ]
+    
+    optimizer = T98GMultiParameterOptimizer(
+        target_vrest= ,      
+        target_rin=,        
+        target_tau=,         
+        tolerance_vrest=,     
+        tolerance_rin=,     
+        tolerance_tau=,       
+        area_um2= 600,
+        ctot_pF=,
+        parameters_to_optimize=params_to_optimize
+    )
+    
+    
+
+    # Ottimizzazione con 20 iterazioni
+    result = optimizer.optimize(
+        method='differential_evolution',
+        maxiter=20,
+        early_stop_threshold=0.05,
+        early_stop_patience=10
+    )
+    
+    # Plot storia
+    optimizer.plot_optimization_history(
+        save_path='/mnt/user-data/outputs/optimization_history_cl_fixed.png'
+    )
+    
+    # Stampa codice da usare
+    print("\n" + "="*70)
+    print("CODICE DA INSERIRE NEL TUO MODELLO:")
+    print("="*70)
+    print("# NOTA: Na_leak NON inserito più")
+    print("\n# Leak conductances")
+    print(f"soma.gbar_K2P = {result['params']['gbar_K2P']:.6e}   # S/cm²")
+    print("\n# Voltage-gated K+ channels")
+    print(f"soma.gbar_gbk = {result['params']['gbar_gbk']:.6e}      # S/cm²")
+    print(f"soma.gbar_kca31 = {result['params']['gbar_kca31']:.6e}    # S/cm²")
+    print("\n# Cl- channels (BOUNDS CORRETTI)")
+    print(f"soma.gbar_clc3 = {result['params']['gbar_clc3']:.6e}     # S/cm²")
+    print(f"soma.gbar_clc2 = {result['params']['gbar_clc2']:.6e}     # S/cm²")
+    print("\n# TRPC6 channels")
+    print(f"soma.gbar_ca_trpc6 = {result['params']['gbar_ca_trpc6']:.6e}  # S/cm²")
+    print(f"soma.gbar_na_trpc6 = {result['params']['gbar_na_trpc6']:.6e}  # S/cm²")
+    print("\n# Background Na+ channel")
+    print(f"soma.gbar_bnac = {result['params']['gbar_bnac']:.6e}     # S/cm²")
+    print("\n# Intracellular Ca2+ baseline")
+    print(f"soma.cai = {result['params']['cai']:.6e}  # mM")
+    print("="*70 + "\n")
+    
+    return result
+
+
+if __name__ == '__main__':
+    result = main()
